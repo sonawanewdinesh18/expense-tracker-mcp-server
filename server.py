@@ -1,43 +1,16 @@
 """
 server.py
 ---------
-A fully functional, multi-user Expense Tracker MCP server, backed by
-Supabase, deployable as a remote server that many different people can
-connect to at once -- each one only ever seeing their own expenses.
-
-How multi-user isolation works:
-  1. Each user is given a personal API key (see create_user.py).
-  2. When they connect, their MCP client sends that key as:
-         Authorization: Bearer <their-api-key>
-  3. SupabaseAPIKeyVerifier below looks that key up in Supabase and
-     resolves it to a user_id.
-  4. Every tool call reads that user_id via get_access_token() and passes
-     it into every database query -- so User A can never see, edit, or
-     delete User B's expenses, even though they're both hitting the same
-     running server.
-
-Run it:
-    Local dev (stdio, for Claude Desktop):
-        python server.py --stdio
-
-    Local dev (HTTP, for testing with the Inspector or a browser client):
-        python server.py
-
-    Production (what the Dockerfile runs):
-        python server.py
+Expense Tracker MCP Server backed by Neon PostgreSQL.
+Deployable to FastMCP Cloud (Prefect Horizon), Render, Railway, Docker,
+or local development (FastMCP dev / Inspector / Claude Desktop).
 """
 
 import os
-import sys
 from datetime import date
 from typing import Optional
-
-from pydantic import AnyHttpUrl
-
-from mcp.server.mcpserver import MCPServer
-from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
-from mcp.server.auth.middleware.auth_context import get_access_token
+from dotenv import load_dotenv
+from fastmcp import FastMCP
 
 from db import (
     lookup_user_id_by_api_key,
@@ -49,145 +22,101 @@ from db import (
     db_list_categories,
 )
 
+load_dotenv()
+
+# Create the FastMCP server instance (this is what FastMCP Cloud / Horizon imports)
+mcp = FastMCP(
+    "expenses-maneger",
+    instructions="Track, list, update, and summarize personal expenses backed by Neon PostgreSQL.",
+)
+
 VALID_PERIODS = {"week", "month", "year", "all"}
+DEFAULT_USER_ID = "bca2fa1b-24fb-4937-9964-c4eface24860"
+
+
+def _resolve_user_id(user_id: Optional[str], api_key: Optional[str]) -> str:
+    """Resolve user identity from API key, user_id param, or environment default."""
+    if api_key:
+        resolved = lookup_user_id_by_api_key(api_key)
+        if resolved:
+            return resolved
+    if user_id and user_id.strip():
+        return user_id.strip()
+    return os.environ.get("DEFAULT_USER_ID", DEFAULT_USER_ID)
 
 
 # ---------------------------------------------------------------------
-# 1. Authentication: verify each request's API key against Supabase
+# MCP Tools
 # ---------------------------------------------------------------------
 
-class SupabaseAPIKeyVerifier(TokenVerifier):
-    """Treats each user's personal API key as an OAuth-style bearer token.
-
-    MCP's auth layer expects a TokenVerifier; it doesn't care whether the
-    token is a "real" OAuth token or, as here, a long random string we
-    mint ourselves and store in Supabase. Either way, this class is the
-    single place that decides whether a request is allowed through.
-    """
-
-    async def verify_token(self, token: str) -> Optional[AccessToken]:
-        user_id = lookup_user_id_by_api_key(token)
-        if user_id is None:
-            return None  # unknown/revoked key -> request gets a 401
-        return AccessToken(
-            token=token,
-            client_id=user_id,       # we stash the user_id here
-            scopes=["expense_tracker"],
-        )
-
-
-def _current_user_id() -> str:
-    """Every tool calls this first to find out WHO is calling."""
-    access_token = get_access_token()
-    if access_token is None:
-        # Only happens over stdio (no HTTP auth) or if auth is misconfigured.
-        raise PermissionError(
-            "No authenticated user found. Connect over Streamable HTTP with "
-            "'Authorization: Bearer <your-api-key>', or run with --stdio for "
-            "trusted local single-user use."
-        )
-    return access_token.client_id
-
-
-# ---------------------------------------------------------------------
-# 2. Build the server
-# ---------------------------------------------------------------------
-
-SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
-STDIO_MODE = "--stdio" in sys.argv  # local single-user mode, no HTTP auth needed
-
-if STDIO_MODE:
-    # Over stdio there is no HTTP layer, so there's nothing to attach
-    # bearer-token auth to -- the process boundary itself is the security
-    # boundary. Great for local testing; not for the shared remote server.
-    mcp = MCPServer(
-        "Expense Tracker",
-        instructions="Track, list, update, and summarize personal expenses.",
-    )
-    LOCAL_STDIO_USER_ID = os.environ.get("LOCAL_USER_ID", "local-dev-user")
-else:
-    mcp = MCPServer(
-        "Expense Tracker",
-        instructions=(
-            "Track, list, update, and summarize personal expenses. "
-            "Every user's data is private to their own API key."
-        ),
-        token_verifier=SupabaseAPIKeyVerifier(),
-        auth=AuthSettings(
-            issuer_url=AnyHttpUrl(SERVER_URL),
-            resource_server_url=AnyHttpUrl(SERVER_URL),
-            required_scopes=["expense_tracker"],
-        ),
-    )
-
-
-def _user_id() -> str:
-    if STDIO_MODE:
-        return LOCAL_STDIO_USER_ID
-    return _current_user_id()
-
-
-# ---------------------------------------------------------------------
-# 3. Tools
-# ---------------------------------------------------------------------
-
-@mcp.tool()
-async def add_expense(
+@mcp.tool
+def add_expense(
     amount: float,
     category: str,
     description: str = "",
     expense_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict:
-    """Add a new expense for the current user.
+    """Add a new expense record.
 
     amount: positive number, e.g. 12.50
-    category: a short label, e.g. "Food", "Transport", "Rent"
-    description: optional free-text note
-    expense_date: optional date in YYYY-MM-DD format; defaults to today
+    category: short label, e.g. "Food", "Transport", "Rent"
+    description: optional note
+    expense_date: optional date in YYYY-MM-DD format (defaults to today)
+    user_id: optional user identifier
+    api_key: optional API key (et_...) to scope to a specific user
     """
-    user_id = _user_id()
     if amount <= 0:
         raise ValueError("amount must be greater than 0")
 
+    uid = _resolve_user_id(user_id, api_key)
     d = expense_date or date.today().isoformat()
     clean_category = category.strip().title()
 
-    row = db_add_expense(user_id, amount, clean_category, description, d)
+    row = db_add_expense(uid, amount, clean_category, description, d)
     return {"status": "created", "expense": row}
 
 
-@mcp.tool()
-async def list_expenses(
+@mcp.tool
+def list_expenses(
     category: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit: int = 50,
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict:
-    """List the current user's expenses, most recent first.
+    """List expenses, sorted by date descending.
 
-    category: optional exact category filter, e.g. "Food"
+    category: optional category filter, e.g. "Food"
     start_date / end_date: optional YYYY-MM-DD range filters (inclusive)
-    limit: max rows to return (default 50)
+    limit: maximum number of rows to return (default 50)
+    user_id: optional user identifier
+    api_key: optional API key (et_...) to scope to a specific user
     """
-    user_id = _user_id()
+    uid = _resolve_user_id(user_id, api_key)
     clean_category = category.strip().title() if category else None
-    rows = db_list_expenses(user_id, clean_category, start_date, end_date, limit)
+    rows = db_list_expenses(uid, clean_category, start_date, end_date, limit)
     return {"count": len(rows), "expenses": rows}
 
 
-@mcp.tool()
-async def update_expense(
+@mcp.tool
+def update_expense(
     expense_id: str,
     amount: Optional[float] = None,
     category: Optional[str] = None,
     description: Optional[str] = None,
     expense_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict:
-    """Update one or more fields of an expense the current user owns.
+    """Update one or more fields of an existing expense.
 
-    Only pass the fields you want to change -- everything else is left as-is.
+    expense_id: UUID of the expense to update
+    Only provide the fields you want to change.
     """
-    user_id = _user_id()
+    uid = _resolve_user_id(user_id, api_key)
     fields: dict = {}
 
     if amount is not None:
@@ -204,60 +133,69 @@ async def update_expense(
     if not fields:
         raise ValueError("Provide at least one field to update.")
 
-    row = db_update_expense(user_id, expense_id, fields)
+    row = db_update_expense(uid, expense_id, fields)
     if row is None:
-        raise ValueError("Expense not found, or it doesn't belong to you.")
+        raise ValueError("Expense not found, or it doesn't belong to this user.")
     return {"status": "updated", "expense": row}
 
 
-@mcp.tool()
-async def delete_expense(expense_id: str) -> dict:
-    """Permanently delete an expense the current user owns."""
-    user_id = _user_id()
-    ok = db_delete_expense(user_id, expense_id)
+@mcp.tool
+def delete_expense(
+    expense_id: str,
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """Permanently delete an expense.
+
+    expense_id: UUID of the expense to delete
+    """
+    uid = _resolve_user_id(user_id, api_key)
+    ok = db_delete_expense(uid, expense_id)
     if not ok:
-        raise ValueError("Expense not found, or it doesn't belong to you.")
+        raise ValueError("Expense not found, or it doesn't belong to this user.")
     return {"status": "deleted", "expense_id": expense_id}
 
 
-@mcp.tool()
-async def get_summary(period: str = "month") -> dict:
-    """Summarize the current user's spending.
+@mcp.tool
+def get_summary(
+    period: str = "month",
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """Summarize spending with totals and per-category breakdown.
 
-    period: one of "week", "month", "year", "all"
-    Returns the total spent, transaction count, and a per-category breakdown.
+    period: one of "week", "month", "year", "all" (default "month")
     """
-    user_id = _user_id()
+    uid = _resolve_user_id(user_id, api_key)
     if period not in VALID_PERIODS:
         raise ValueError(f"period must be one of: {', '.join(sorted(VALID_PERIODS))}")
-    return db_get_summary(user_id, period)
+    return db_get_summary(uid, period)
 
 
-@mcp.tool()
-async def list_categories() -> dict:
-    """List the distinct expense categories the current user has used so far."""
-    user_id = _user_id()
-    return {"categories": db_list_categories(user_id)}
+@mcp.tool
+def list_categories(
+    user_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """List all distinct expense categories recorded so far."""
+    uid = _resolve_user_id(user_id, api_key)
+    return {"categories": db_list_categories(uid)}
 
 
-@mcp.prompt()
+@mcp.prompt
 def monthly_report_prompt() -> str:
-    """A ready-made prompt for generating a friendly monthly spending report."""
+    """A ready-made prompt for generating a comprehensive monthly spending report."""
     return (
-        "Call get_summary with period='month' and list_expenses for this "
-        "month, then write a short, friendly summary: total spent this "
-        "month, the top 3 spending categories, and one practical, specific "
-        "suggestion for reducing spending next month."
+        "Call get_summary with period='month' and list_expenses for this month. "
+        "Then generate a clear summary containing: total amount spent, top 3 spending categories, "
+        "and practical recommendations to optimize expenses next month."
     )
 
 
 # ---------------------------------------------------------------------
-# 4. Entrypoint
+# Entrypoint
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if STDIO_MODE:
-        mcp.run(transport="stdio")
-    else:
-        port = int(os.environ.get("PORT", 8000))
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    mcp.run(transport="sse", port=port, host="0.0.0.0")
